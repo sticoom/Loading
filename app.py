@@ -32,12 +32,10 @@ def process_core_pool(pool_df, pool_name):
     
     df = pool_df.copy()
     
-    # 【修复重点 1】: 强制清理 Excel 带来的 NaN 空值，防止判定失效
+    # 【数据防呆】清理 NaN 空值
     for col in ['最终库区简称', '系统分配柜号', '装柜地址', '排柜备注']:
-        if col not in df.columns: 
-            df[col] = ""
-        else:
-            df[col] = df[col].fillna("").astype(str).replace('nan', '').str.strip()
+        if col not in df.columns: df[col] = ""
+        else: df[col] = df[col].fillna("").astype(str).replace('nan', '').str.strip()
             
     df['最终库区简称'] = df['当前库区'].apply(extract_short_name)
     df['待发货体积(CBM)'] = pd.to_numeric(df['待发货体积(CBM)'], errors='coerce').fillna(0)
@@ -48,9 +46,8 @@ def process_core_pool(pool_df, pool_name):
     remain_dfs = []
     initial_totals = {}
     
-    # ---------------- 第二阶段：同区域宏观算账与整柜 ----------------
+    # ---------------- 第二阶段：同区域宏观算账与瀑布流整柜 ----------------
     for region in regions:
-        # 只抓取还未排柜的数据
         r_df = df[(df['当前区域'] == region) & (df['装柜地址'] == "")].copy()
         if r_df.empty: 
             initial_totals[region] = 0
@@ -61,14 +58,14 @@ def process_core_pool(pool_df, pool_name):
         
         # 1. 摸底定额
         if total_vol < 60:
-            remain_dfs.append(r_df)
+            remain_dfs.append(r_df) # 直接进入第三阶段散货池
             continue
             
         X = math.floor(total_vol / 71.0)
-        if (total_vol % 71.0) >= 60: X += 1 # 尾数如果>=60，也算一个整柜
+        if (total_vol % 71.0) >= 60: X += 1 
         if X == 0: X = 1
         
-        # 2. 商检强绑定 (占用名额)
+        # 2. 商检强绑定 (占用主导名额)
         inspections = r_df[r_df['是否商检'] == '是']
         insp_cabs = 0
         if not inspections.empty:
@@ -82,10 +79,10 @@ def process_core_pool(pool_df, pool_name):
                 for idx in inspections.index:
                     r_df.at[idx, '装柜地址'] = f"{main_insp_wh}装柜-{region}"
                     r_df.at[idx, '系统分配柜号'] = cab_name
-            X = max(0, X - insp_cabs)
+            X = max(0, X - insp_cabs) # 扣减理论名额
             
-        # 3. 选定剩余主导地址
-        normal_df = r_df[(r_df['装柜地址'] == "") & (~r_df['最终库区简称'].isin(LOCAL_WH))]
+        # 3. 选定剩余主导地址 (完全放开本地仓限制，全体降序)
+        normal_df = r_df[r_df['装柜地址'] == ""]
         wh_vols = normal_df.groupby('最终库区简称')['待发货体积(CBM)'].sum().sort_values(ascending=False)
         
         lead_whs = []
@@ -94,7 +91,7 @@ def process_core_pool(pool_df, pool_name):
             if wh == "捷鹏" and vol < 50: continue # 捷鹏拦截规则
             lead_whs.append(wh)
             
-        # 4. 【修复重点 2】: 完整补齐瀑布流精准填缝 (贪心算法)
+        # 4. 瀑布流精准填缝 (全局贪心防碎片算法)
         for lead_wh in lead_whs:
             cab_name = f"{pool_name}-整柜{global_cab_idx:02d}"
             global_cab_idx += 1
@@ -107,22 +104,23 @@ def process_core_pool(pool_df, pool_name):
                 r_df.at[idx, '系统分配柜号'] = cab_name
                 current_vol += r_df.at[idx, '待发货体积(CBM)']
                 
-            # (2) 去别的库区抓货填满 60~71方 (优先抓取大块头)
+            # (2) 瀑布流：去别的库区抓货填满 60~71方 
+            # 策略：按体积降序抓取，尽量整单吸纳，避免切碎
             other_items = r_df[r_df['装柜地址'] == ""].sort_values(by='待发货体积(CBM)', ascending=False)
             for idx in other_items.index:
-                if current_vol >= 71.0: break # 已经装满
+                if current_vol >= 71.0: break
                 item_vol = r_df.at[idx, '待发货体积(CBM)']
-                # 如果塞得下这票货 (最高容差放宽至71.5)
+                # 容差放宽至71.5，只要装得下就整票吃进
                 if current_vol + item_vol <= 71.5:  
                     r_df.at[idx, '装柜地址'] = f"{lead_wh}装柜-{region}"
                     r_df.at[idx, '系统分配柜号'] = cab_name
                     current_vol += item_vol
 
-        # 把这轮排好的结果存下来，没排上的丢入尾货池
+        # 将未能凑入整柜的余数推入尾货池
         remain_dfs.append(r_df[r_df['装柜地址'] == ""])
         df.update(r_df[r_df['装柜地址'] != ""])
 
-    # ---------------- 第三阶段：尾货清算 (跨区调拨 vs 散货) ----------------
+    # ---------------- 第三阶段：尾货清算 (跨区合体 vs 本地散货) ----------------
     if remain_dfs:
         remain_all = pd.concat(remain_dfs)
         hd_rem = remain_all[remain_all['当前区域'] == '华东']
@@ -139,16 +137,17 @@ def process_core_pool(pool_df, pool_name):
             recv_df = hn_rem if receiver == '华南' else hd_rem
             send_df = hd_rem if sender == '华东' else hn_rem
             
+            # 接收方装柜库区 = 剩余体积最大者
             recv_main_wh = recv_df.groupby('最终库区简称')['待发货体积(CBM)'].sum().idxmax()
             cab_name = f"{pool_name}-跨区合体柜{global_cab_idx:02d}"
             global_cab_idx += 1
             
-            # 接收方打标
+            # 接收方全部打标
             for idx in recv_df.index:
                 df.at[idx, '装柜地址'] = f"{recv_main_wh}装柜-{receiver}"
                 df.at[idx, '系统分配柜号'] = cab_name
                 
-            # 发出方打标与备注
+            # 发出方打标与备注 (触发优先扣减云仓+破例切分逻辑)
             for idx in send_df.index:
                 sender_wh = df.at[idx, '最终库区简称']
                 df.at[idx, '装柜地址'] = f"{recv_main_wh}装柜-{receiver}"
@@ -161,6 +160,7 @@ def process_core_pool(pool_df, pool_name):
                 if rem_df.empty: continue
                 vol = safe_sum(rem_df)
                 
+                # 判定是 B1 (先天不足) 还是 B2 (合体失败)
                 is_b1 = initial_totals.get(region, 0) < 60
                 cab_count = max(1, math.ceil(vol / 40.0))
                 default_wh = "云仓" if region == "华东" else "深圳仓"
@@ -171,6 +171,7 @@ def process_core_pool(pool_df, pool_name):
                 final_addr = default_wh
                 is_reversed = False
                 
+                # B1 的反转判定逻辑
                 if is_b1:
                     for wh, v in scatter_vols.items():
                         if wh not in LOCAL_WH and v > (def_vol + 5):
@@ -182,6 +183,7 @@ def process_core_pool(pool_df, pool_name):
                     cab_name = f"{region}-散货柜{global_cab_idx:02d}"
                     global_cab_idx += 1
                     
+                    # 散货严格区分命名
                     if is_b1:
                         prefix = f"{final_addr}{i+1}{i+1}"
                         addr_str = f"{prefix}-AMP散货-{region}"
@@ -198,10 +200,10 @@ def process_core_pool(pool_df, pool_name):
     return df
 
 # ================= 网页 UI 渲染 =================
-st.title("📦 亚马逊智能排柜系统 (V1.1 修复版)")
-st.markdown("已修复空值识别故障，并全量挂载瀑布流分配算法。")
+st.title("📦 亚马逊智能排柜系统 (V2.0 终极版)")
+st.markdown("已搭载全局防碎片瀑布流算法、支持本地仓主导排名、严格分离散货命名。")
 
-uploaded_file = st.file_uploader("请上传最新的《排柜草稿》Excel/CSV 文件", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("请上传最新版的《排柜草稿》Excel 或 CSV 文件", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     try:
@@ -212,13 +214,13 @@ if uploaded_file is not None:
             
         st.success(f"✅ 数据读取成功！共加载 {len(raw_df)} 行。")
         
-        if st.button("🚀 启动全局排柜算法", type="primary"):
-            with st.spinner('正在进行数据分流与矩阵运算...'):
+        if st.button("🚀 启动全局排柜引擎", type="primary"):
+            with st.spinner('正在进行数据清洗、算力重组与多维拼柜...'):
                 
-                # 安全清理条件列
-                raw_df['尺寸类型'] = raw_df['尺寸类型'].fillna('').astype(str).str.strip()
-                raw_df['运输方式'] = raw_df['运输方式'].fillna('').astype(str).str.strip()
-                raw_df['入库配置方式'] = raw_df['入库配置方式'].fillna('').astype(str).str.strip()
+                # 安全清理关键列
+                for c in ['尺寸类型', '运输方式', '入库配置方式']:
+                    if c in raw_df.columns:
+                        raw_df[c] = raw_df[c].fillna('').astype(str).str.strip()
                 
                 mask_s1 = raw_df['尺寸类型'].str.contains('标准') & raw_df['运输方式'].str.contains('AGL') & raw_df['入库配置方式'].isin(['AOSS', 'AMP'])
                 mask_s2 = raw_df['尺寸类型'].str.contains('标准') & raw_df['运输方式'].str.contains('AGL') & (raw_df['入库配置方式'] == 'MSS')
@@ -229,21 +231,22 @@ if uploaded_file is not None:
                 sheet3_df = raw_df[mask_s3].copy()
                 sheet4_df = raw_df[~(mask_s1 | mask_s2 | mask_s3)].copy()
                 
-                # 核心运算
+                # 触发核心运算
                 res_sheet1 = process_core_pool(sheet1_df, "AOSS/AMP")
                 res_sheet2 = process_core_pool(sheet2_df, "MSS")
                 
-                # 生成说明文档
+                # 生成业务说明文档
                 readme_df = pd.DataFrame({
                     "排柜逻辑说明": [
-                        "1. AGL快-标准尺寸-AOSS+AMP：系统已执行瀑布流凑柜与调拨算法。",
-                        "2. MSS：逻辑同上，已独立运算完毕。",
-                        "3. SMP：未参与排柜，原样保留。",
-                        "4. 其它方式：过滤出的无需排柜的数据。",
-                        "注：新增列为【最终库区简称】、【系统分配柜号】、【装柜地址】、【排柜备注】。"
+                        "1. AGL快-标准尺寸-AOSS+AMP：执行瀑布流凑柜、支持本地仓主导、跨区调拨合体、B1/B2散货严格区分命名。",
+                        "2. MSS：逻辑同上，与 AOSS/AMP 物理隔离独立运算。",
+                        "3. SMP：未参与排柜，数据原样保留。",
+                        "4. 其它方式：不符合条件的数据，直接过滤隔离。",
+                        "【最终输出列】：最终库区简称、系统分配柜号、装柜地址、排柜备注。"
                     ]
                 })
                 
+                # 调整排序列顺序，方便核对
                 def reorder_cols(df):
                     if df.empty: return df
                     cols = list(df.columns)
@@ -253,9 +256,9 @@ if uploaded_file is not None:
                         cols.append(c)
                     return df[cols]
 
-            st.success("🎉 全局排柜运算完成！")
+            st.success("🎉 全局排柜测算完成！")
             
-            st.subheader("📊 运算结果预览 (核心池1: AOSS+AMP)")
+            st.subheader("📊 运算结果预览 (AOSS+AMP核心池)")
             st.dataframe(reorder_cols(res_sheet1).head(15))
             
             output = io.BytesIO()
@@ -269,12 +272,13 @@ if uploaded_file is not None:
             processed_data = output.getvalue()
             
             st.download_button(
-                label="⬇️ 一键下载最终多表盘 Excel",
+                label="⬇️ 一键下载【最终多表盘排柜表】Excel",
                 data=processed_data,
-                file_name="智能排柜_最终结果.xlsx",
+                file_name="智能排柜_V2终版结果.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
             
     except Exception as e:
         st.error(f"❌ 运行报错: {str(e)}")
+        st.info("提示：请确保草稿内含有 '尺寸类型', '运输方式', '入库配置方式', '当前区域', '待发货体积(CBM)' 等核心列。")
