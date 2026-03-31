@@ -483,7 +483,7 @@ def process_full_pipeline(df, pool_name, mapping_dict):
 # ==========================================
 # 4. Streamlit 网页 UI
 # ==========================================
-st.title("📦 亚马逊智能排柜引擎 (V-Final 终极架构版)")
+st.title("📦 亚马逊智能排柜系统)")
 st.markdown("集成 **重量红线判定**、**商检填缝软捆绑**、**跨区财务价差对决** 与 **刚性 40方物理截断**。")
 
 uploaded_file = st.file_uploader("请上传排柜草稿 (可包含 '供应商简称映射' Sheet)", type=["xlsx"])
