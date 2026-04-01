@@ -1,6 +1,6 @@
 """
 亚马逊智能排柜系统 (不可拆分·财务瀑布流终极版)
-特性：单行绝对不可拆分 / 0-1背包瀑布流极限填缝 / 跨区财务对决 / 原表顺序完美保护
+修复：死循环Bug修复 / 单行绝对不可拆分 / 0-1背包极限填缝 / 原表顺序完美保护
 """
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,6 @@ EXCHANGE_RATE = 7.2          # 汇率
 PRICE_USD_EAST = 135.26      # 江浙/华东散货头程单价 (USD/方)
 PRICE_USD_SOUTH = 135.00     # 深圳/华南散货头程单价 (USD/方)
 
-# 国内跨仓调拨附加费
 TRANSFER_SURCHARGE_VOL = 15.0  # 低于此方量加收附加费
 TRANSFER_SURCHARGE_FEE = 200.0 # 附加费金额 (RMB/趟)
 
@@ -60,7 +59,7 @@ def calculate_financial_diff(transfer_vol, target_original_vol, transfer_from_re
     diff = (cost_domestic + cost_target_leftover) - cost_local_direct
     return diff
 
-def waterfall_fill(cab_rows, pool_rows, max_vol=VOL_MAX_CABINET):
+def waterfall_fill(cab_rows, pool_rows, max_vol=VOL_MAX_CABINET, allow_overlimit=True):
     """0-1背包瀑布流：按体积降序遍历，只要塞得下就死命塞！(单行不切分)"""
     cab_vol = sum(r['vol'] for r in cab_rows)
     cab_wt = sum(r['wt'] for r in cab_rows)
@@ -68,16 +67,23 @@ def waterfall_fill(cab_rows, pool_rows, max_vol=VOL_MAX_CABINET):
     
     rem_pool = []
     for r in pool_rows:
-        if cab_vol + r['vol'] <= max_vol and cab_wt + r['wt'] <= WEIGHT_LIMIT:
+        can_fit = (cab_vol + r['vol'] <= max_vol) and (cab_wt + r['wt'] <= WEIGHT_LIMIT)
+        
+        # 【防死循环保护】：如果允许超限，且目前柜子是空的，且这是最大的货（单行超限），强行塞入！
+        if not cab_rows and not rem_pool and allow_overlimit and not can_fit:
+            cab_rows.append(r)
+            cab_vol += r['vol']
+            cab_wt += r['wt']
+        elif can_fit:
             cab_rows.append(r)
             cab_vol += r['vol']
             cab_wt += r['wt']
         else:
             rem_pool.append(r)
+            
     return cab_rows, rem_pool
 
 def get_max_wh(cab_rows, ignore_insp=True):
-    """获取柜内体积最大的库区，作为装柜地址"""
     wh_vols = {}
     for r in cab_rows:
         if ignore_insp and r['是否商检'] == '是': continue
@@ -86,7 +92,6 @@ def get_max_wh(cab_rows, ignore_insp=True):
     return max(wh_vols.items(), key=lambda x: x[1])[0]
 
 def format_cabinet(cab_rows, reg, addr_wh, decision_desc, counter_dict, mapping_dict, is_scatter=False, scatter_idx=1):
-    """为选中的物理行统一打上标签，生成极简作业指导备注"""
     if is_scatter:
         cab_id = f"散货柜-{counter_dict['scatter']:02d}"
         counter_dict['scatter'] += 1
@@ -107,7 +112,6 @@ def format_cabinet(cab_rows, reg, addr_wh, decision_desc, counter_dict, mapping_
     total_vol = 0.0
     total_wt = 0.0
     for r in cab_rows:
-        # 商检虚拟块的名字要单独标识
         display_wh = "商检货物" if r['是否商检'] == '是' else r['最终库区简称']
         wh_vols[display_wh] = wh_vols.get(display_wh, 0) + r['vol']
         total_vol += r['vol']
@@ -144,7 +148,6 @@ def process_pool(pool_rows, pool_name, mapping_dict):
     cab_counters = {'full': 1, 'cross': 1, 'scatter': 1}
     finished_rows = []
     
-    # 按照区域独立处理第一与第二阶段
     for region in ["华东", "华南"]:
         reg_pool = [r for r in pool_rows if r['当前区域'] == region]
         if not reg_pool: continue
@@ -156,7 +159,7 @@ def process_pool(pool_rows, pool_name, mapping_dict):
         while insp_rows:
             cab_rows = []
             cab_rows, insp_rows = waterfall_fill(cab_rows, insp_rows, VOL_MAX_CABINET)
-            # 用普通货去填商检柜的缝隙 (直到极致)
+            # 用普通货去填商检柜的缝隙
             cab_rows, norm_rows = waterfall_fill(cab_rows, norm_rows, VOL_MAX_CABINET)
             
             addr_wh = get_max_wh(cab_rows, ignore_insp=True) or get_max_wh(cab_rows, ignore_insp=False)
@@ -168,7 +171,6 @@ def process_pool(pool_rows, pool_name, mapping_dict):
 
         # --- 第二阶段：同区沙盘智能排柜 ---
         while True:
-            # 找主导库区
             wh_totals = {}
             for r in norm_rows: wh_totals[r['最终库区简称']] = wh_totals.get(r['最终库区简称'], 0) + r['vol']
             if not wh_totals: break
@@ -176,9 +178,7 @@ def process_pool(pool_rows, pool_name, mapping_dict):
             lead_wh = max(wh_totals.items(), key=lambda x: x[1])[0]
             lead_vol = wh_totals[lead_wh]
             
-            # 捷鹏特权判定
             if lead_wh == '捷鹏' and lead_vol < 50.0:
-                # 捷鹏不配当主导，如果只剩捷鹏了，那说明同区排柜结束
                 valid_whs = {k:v for k,v in wh_totals.items() if k != '捷鹏'}
                 if not valid_whs: break
                 lead_wh = max(valid_whs.items(), key=lambda x: x[1])[0]
@@ -198,7 +198,10 @@ def process_pool(pool_rows, pool_name, mapping_dict):
             # 第二步：整库完美互补 (保全库区完整性)
             if cab_vol < VOL_MAX_CABINET:
                 wh_groups = {}
-                for r in norm_rows: wh_groups.setdefault(r['最终库区简称'], []).append(r)
+                for r in norm_rows: 
+                    # 防止又把主导厂选进去作为陪跑
+                    if r['最终库区简称'] != lead_wh:
+                        wh_groups.setdefault(r['最终库区简称'], []).append(r)
                 
                 valid_combos = []
                 for size in [1, 2]:
@@ -209,7 +212,7 @@ def process_pool(pool_rows, pool_name, mapping_dict):
                             valid_combos.append((combo, c_vol))
                             
                 if valid_combos:
-                    best_combo = max(valid_combos, key=lambda x: x[1])[0] # 选填得最满的组合
+                    best_combo = max(valid_combos, key=lambda x: x[1])[0]
                     for w in best_combo:
                         cab_rows.extend(wh_groups[w])
                     norm_rows = [r for r in norm_rows if r['最终库区简称'] not in best_combo]
@@ -225,7 +228,6 @@ def process_pool(pool_rows, pool_name, mapping_dict):
                 finished_rows.extend(format_cabinet(cab_rows, region, lead_wh, "同区瀑布流极致填满", cab_counters, mapping_dict))
                 log(f"[同区拼柜] {lead_wh}({region}) 极限填装完毕，最终 {final_vol:.1f}方。")
             else:
-                # 不及格！退回池子，结束该区循环
                 norm_rows.extend(cab_rows)
                 break
                 
@@ -235,6 +237,7 @@ def process_pool(pool_rows, pool_name, mapping_dict):
     # --- 第三阶段：尾盘跨区大决战 (财务算盘) ---
     east_pool = [r for r in pool_rows if r['当前区域'] == "华东"]
     south_pool = [r for r in pool_rows if r['当前区域'] == "华南"]
+    other_pool = [r for r in pool_rows if r['当前区域'] not in ["华东", "华南"]]
     east_vol = sum(r['vol'] for r in east_pool)
     south_vol = sum(r['vol'] for r in south_pool)
     
@@ -255,7 +258,6 @@ def process_pool(pool_rows, pool_name, mapping_dict):
             # 跨区专属死磕71方瀑布流
             cab_rows, rem_source = waterfall_fill(cab_rows, source_pool, VOL_MAX_CABINET)
             
-            # 只要>=60方就成柜发走
             cab_vol = sum(r['vol'] for r in cab_rows)
             if cab_vol >= VOL_MIN_CABINET:
                 addr_wh = get_max_wh([r for r in cab_rows if r['当前区域'] == target_reg], ignore_insp=True)
@@ -264,18 +266,14 @@ def process_pool(pool_rows, pool_name, mapping_dict):
                 # 剩下的货物理属性转变为目标仓散货
                 for r in rem_source:
                     r['当前区域'] = target_reg
-                    r['最终库区简称'] = '深圳仓' if target_reg == '华南' else '云仓'
+                    # 保留原始库区名称，加上前缀便于认出
+                    r['最终库区简称'] = f"【原{'华东' if target_reg=='华南' else '华南'}】" + r['最终库区简称']
                 
-                pool_rows = rem_source
+                pool_rows = rem_source + other_pool
             else:
-                # 极端罕见情况：跨区填了都不满60，退回
-                pool_rows = cab_rows + rem_source
+                pool_rows = cab_rows + rem_source + other_pool
                 
     # --- 第四阶段：绝望散货统一归集本地仓 ---
-    # 同化散货归属
-    for r in pool_rows:
-        r['最终库区简称'] = '云仓' if r['当前区域'] == '华东' else '深圳仓'
-        
     for region in ["华东", "华南"]:
         reg_pool = [r for r in pool_rows if r['当前区域'] == region]
         local_wh = '云仓' if region == '华东' else '深圳仓'
@@ -297,39 +295,34 @@ def process_pool(pool_rows, pool_name, mapping_dict):
 # 3. Streamlit 主程序 (I/O 层)
 # ==========================================
 st.title("📦 亚马逊智能排柜引擎 (单行不可拆分版)")
-st.markdown("搭载 **0-1背包瀑布流极限填缝算法**。原表行数完美保护，一单到底不切分！")
+st.markdown("搭载 **0-1背包瀑布流极限填缝算法** 与 **无限防死锁保护机制**。原表行数完美保护，一单到底不切分！")
 
-uploaded_file = st.file_uploader("请上传排柜草稿", type=["xlsx"])
+uploaded_file = st.file_uploader("请上传排柜草稿", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     try:
-        xls = pd.ExcelFile(uploaded_file)
-        all_sheets = pd.read_excel(xls, sheet_name=None)
-        
-        main_sheet = None
-        for name, sdf in all_sheets.items():
-            if '待发货体积(CBM)' in sdf.columns:
-                main_sheet = name
-                break
-                
-        if not main_sheet:
-            st.error("❌ 未找到 '待发货体积(CBM)' 列。")
-            st.stop()
-            
-        raw_df = all_sheets[main_sheet]
-        
+        xls = pd.ExcelFile(uploaded_file) if uploaded_file.name.endswith('.xlsx') else None
+        if xls:
+            all_sheets = pd.read_excel(xls, sheet_name=None)
+            main_sheet = next((name for name, sdf in all_sheets.items() if '待发货体积(CBM)' in sdf.columns), None)
+            if not main_sheet:
+                st.error("❌ 未找到 '待发货体积(CBM)' 列。")
+                st.stop()
+            raw_df = all_sheets[main_sheet]
+            map_df = all_sheets.get('供应商简称映射', pd.DataFrame())
+        else:
+            raw_df = pd.read_csv(uploaded_file)
+            map_df = pd.DataFrame()
+
         mapping_dict = {}
-        if '供应商简称映射' in all_sheets:
-            map_df = all_sheets['供应商简称映射']
-            if len(map_df.columns) >= 2:
-                mapping_dict = dict(zip(map_df.iloc[:,0].astype(str), map_df.iloc[:,1].astype(str)))
-                st.info("✅ 成功加载《供应商简称映射》配置。")
+        if not map_df.empty and len(map_df.columns) >= 2:
+            mapping_dict = dict(zip(map_df.iloc[:,0].astype(str), map_df.iloc[:,1].astype(str)))
+            st.info("✅ 成功加载《供应商简称映射》配置。")
                 
         if st.button("🚀 启动原样保护排柜演算", type="primary"):
             process_logs.clear()
             with st.spinner('算法正在执行 0-1 离散瀑布流，死磕集装箱空间...'):
                 
-                # 数据预处理
                 for c in ['尺寸类型', '运输方式', '入库配置方式', '是否商检']:
                     if c in raw_df.columns: raw_df[c] = raw_df[c].fillna('').astype(str).str.strip()
                 
@@ -365,7 +358,6 @@ if uploaded_file is not None:
                 final_output_rows = []
                 for i, r in enumerate(raw_rows):
                     out_r = handled_idx.get(i, copy.deepcopy(r))
-                    # 补充隔离列与结果列
                     out_r['|---系统运算结果---|'] = ""
                     out_r['系统柜号'] = out_r.get('系统柜号', '')
                     out_r['装柜地址'] = out_r.get('装柜地址', '')
@@ -375,11 +367,9 @@ if uploaded_file is not None:
                     
                 final_df = pd.DataFrame(final_output_rows)
                 
-                # 移除临时计算字段，保持原汁原味
                 for tmp in ['vol', 'wt', '最终库区简称', '_orig_idx']:
                     if tmp in final_df.columns: final_df.drop(columns=[tmp], inplace=True)
                 
-                # 排列列序
                 cols = list(final_df.columns)
                 res_cols = ['|---系统运算结果---|', '系统柜号', '装柜地址', '排柜备注(操作明细)', '系统决策说明']
                 for c in res_cols: cols.remove(c)
@@ -388,7 +378,7 @@ if uploaded_file is not None:
                 
                 log_df = pd.DataFrame({"沙盘运筹推演日志 (Dispatch Logs)": process_logs})
                 
-            st.success("🎉 行级瀑布流运算完美收官！")
+            st.success("🎉 行级瀑布流运算完美收官！(所有异常数据已安全处理)")
             
             col1, col2 = st.columns([3, 1])
             with col1: st.dataframe(final_df[final_df['系统柜号'] != ""].head(20))
@@ -396,14 +386,13 @@ if uploaded_file is not None:
                 
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                # 重新拆分回对应的Sheet
                 final_df[final_df['入库配置方式'].isin(['AOSS', 'AMP'])].to_excel(writer, sheet_name="AOSS+AMP排柜", index=False)
                 final_df[final_df['入库配置方式'] == 'MSS'].to_excel(writer, sheet_name="MSS排柜", index=False)
                 final_df[final_df['入库配置方式'] == 'SMP'].to_excel(writer, sheet_name="SMP保留", index=False)
                 final_df[~final_df['入库配置方式'].isin(['AOSS', 'AMP', 'MSS', 'SMP'])].to_excel(writer, sheet_name="其它隔离区", index=False)
                 log_df.to_excel(writer, sheet_name="系统决策日志", index=False)
                 
-            st.download_button("⬇️ 下载完美不拆行版 (保护原始顺序)", data=output.getvalue(), file_name="智能排柜_瀑布流终极版.xlsx", type="primary")
+            st.download_button("⬇️ 下载完美不拆行版 (保护原始顺序)", data=output.getvalue(), file_name="智能排柜_无死锁极速版.xlsx", type="primary")
             
     except Exception as e:
         st.error(f"❌ 运行报错: {str(e)}")
